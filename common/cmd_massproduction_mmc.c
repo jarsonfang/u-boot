@@ -5,6 +5,7 @@
 #include <linux/ctype.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <u-boot/md5.h>
 
 #define SYS_RESET              "reset"                            /* perform RESET of the CPU */
 #define USB_RESET              "usb reset"                        /* reset (rescan) USB controller */
@@ -13,7 +14,7 @@
 #define MMC_LIST               "mmc list"                         /* lists available devices */
 #define MMC_PART               "mmc part"                         /* lists available partition on current mmc device */
 #define MMC_WRITE              "mmc write %lx %lx %lx"            /* mmc write addr blk# cnt */
-#define SEARCH_UPGRADE_FILES   "fatls %s %x:%x"                   /* from "mmc" or "usb" */
+#define SEARCH_UPGRADE_FILES   "fatls %s %x:%x %s"                /* from "mmc" or "usb" */
 #define LOAD_FILE_FROM_STORAGE "fatload %s %x:%x %lx %s %lx %lx"  /* from "mmc" or "usb" */
 #define MD5SUM_VERIFY          "md5sum -v %lx %lx %s"             /* verify md5sum of memory area */
 
@@ -25,6 +26,7 @@
 #define MASPRO_FILE_NAME       "maspro.txt"                       /* production control file */
 
 #define PREFIX                 "MASPRO: "                         /* Output prefix */
+#define SEARCH_FILE_PATH       "/upgrade"                         /* Upgrade files directory on usb or mmc device, must use absolute path */
 
 #define MBR_MD5_ENV            "mbr_md5"
 #define UBOOT_MD5_ENV          "uboot_md5"
@@ -42,6 +44,7 @@
 
 #define KB (0x400)     /* 1024 bytes */
 #define MB (0x100000)  /* 1024 * 1024 bytes */
+#define CHUNK_SIZE (8*MB) /* file read chunk size */
 #define TIMEOUT (5)    /* 5s, time to wait before system reboot */
 
 enum {
@@ -343,9 +346,9 @@ static int scan_storage(void) {
 /*
  * Scan storage for upgrade files
  */
-static void search_upgrade_files(void) {
+static void search_upgrade_files(const char *dir) {
 	snprintf(cmd_buf, sizeof(cmd_buf), SEARCH_UPGRADE_FILES,
-			  (IF_USB == interface) ? "usb" : "mmc", current_dev, current_devpart);
+			  (IF_USB == interface) ? "usb" : "mmc", current_dev, current_devpart, dir);
 	run_command(cmd_buf, 0);
 }
 
@@ -358,8 +361,12 @@ static ulong read_file(unsigned long addr, char *file_name, long size, long pos)
 		return 0;
 	}
 	
+	char file_path[64] = {'\0'};
+	snprintf(file_path, sizeoof(file_path), "%s/%s", SEARCH_FILE_PATH, file_name);
+	file_path[sizeof(file_path) - 1] = '\0';
+
 	snprintf(cmd_buf, sizeof(cmd_buf), LOAD_FILE_FROM_STORAGE,
-			  (IF_USB == interface) ? "usb" : "mmc", current_dev, current_devpart, addr, file_name, size, pos);
+			  (IF_USB == interface) ? "usb" : "mmc", current_dev, current_devpart, addr, file_path, size, pos);
 	run_command(cmd_buf, 0);
 
 	return getenv_ulong("filesize", 16, 0);
@@ -609,9 +616,10 @@ static void update_uboot(void) {
 }
 
 static void update_boot_part(void) {
-	long file_size = maspro_get_filesize(BOOT_FILE_NUM);
+	//long file_size = maspro_get_filesize(BOOT_FILE_NUM);
 	char *file_name = maspro_get_filename(BOOT_FILE_NUM);
 	char *md5sum = maspro_get_md5sum(BOOT_FILE_NUM);
+	ulong chunk_size = CHUNK_SIZE;
 
 	if ((NULL == file_name) || (NULL == md5sum)) {
 		return;
@@ -619,6 +627,7 @@ static void update_boot_part(void) {
 
 	lcd_print("Upgrading %s ... ", file_name);
 
+#if 0
 	/* sanity check */
 	if (file_size != 16*MB) { /* BOOT_SPACE size is 16 MiB */
 		lcd_print("\n" PREFIX "Invalid file size of %s\n", file_name);
@@ -634,6 +643,37 @@ static void update_boot_part(void) {
 		maspro_set_status(BOOT_FILE_NUM, FAILED);
 		return;
 	}
+#else
+
+	// do MD5SUM verify by chunks.
+	void *buf;
+	long pos = 0;
+	unsigned long bytes = 0;
+	struct MD5Context mdContext;
+	unsigned char md5sum_code[16] = {0};
+	char md5sum_str[MD5SUM_LENGTH + 1] = {'\0'};
+
+	buf = map_sysmem(LOAD_ADDR, chunk_size);
+	MD5Init(&mdContext);
+	while((bytes = read_file(LOAD_ADDR, file_name, chunk_size, pos)) != 0) {
+	    pos += bytes;
+	    MD5Update(&mdContext, buf, bytes);
+	}
+	MD5Final(md5sum_code, &mdContext);
+	unmap_sysmem(buf);
+
+	int i = 0;
+    for (i = 0; i < 16; i++) {
+		sprintf(md5sum_str + 2*i, "%02x", md5sum_code[i]);
+	}
+
+	if(0 != strncmp(md5sum_str, md5sum, MD5SUM_LENGTH))
+	{
+	    maspro_set_status(ROOTFS_FILE_NUM, FAILED);
+		lcd_print("\n" PREFIX "md5sum verify error!\n");
+		return;
+	}
+#endif
 
 	/* md5sum check */
 	if (md5sum_check_equaled(BOOT_FILE_NUM, md5sum)) {
@@ -642,21 +682,44 @@ static void update_boot_part(void) {
 		return;
 	}
 
+
+#if 0
 	/* do upgrade */
 	ulong blkcnt = cal_blkcnt(size);
 	snprintf(cmd_buf, sizeof(cmd_buf), MMC_DEV, 0, 0);
 	run_command(cmd_buf, 0);
 	snprintf(cmd_buf, sizeof(cmd_buf), MMC_WRITE, (ulong)LOAD_ADDR, (ulong)BOOT_BLK_START, blkcnt);
 	run_command(cmd_buf, 0);
+#else
+	/*
+	 * do upgrade
+	 * do it in chunks of 64M to fit into DDR RAM of the smallest module
+	 */
+	snprintf(cmd_buf, sizeof(cmd_buf), MMC_DEV, 0, 0);
+	run_command(cmd_buf, 0);
 
+	ulong blkcnt = 0;
+	ulong blkstart = BOOT_BLK_START;
+	ulong file_pos = 0;
+	ulong size = 0;
+	do {
+		size = read_file(LOAD_ADDR, file_name, chunk_size, file_pos);
+		blkcnt = cal_blkcnt(size);
+		snprintf(cmd_buf, sizeof(cmd_buf), MMC_WRITE, (ulong)LOAD_ADDR, blkstart, blkcnt);
+		run_command(cmd_buf, 0);
+
+		file_pos += size;
+		blkstart += blkcnt;
+	} while (size == chunk_size);
+#endif
 	md5sum_save(BOOT_FILE_NUM, md5sum);
 	lcd_print("Done\n");
 }
 
 static void update_rootfs(void) {
-	long file_size = maspro_get_filesize(ROOTFS_FILE_NUM);
 	char *file_name = maspro_get_filename(ROOTFS_FILE_NUM);
 	char *md5sum = maspro_get_md5sum(ROOTFS_FILE_NUM);
+	ulong chunk_size = CHUNK_SIZE;
 
 	if ((NULL == file_name) || (NULL == md5sum)) {
 		return;
@@ -664,13 +727,14 @@ static void update_rootfs(void) {
 
 	lcd_print("Upgrading %s ... ", file_name);
 
+#if 0
 	/* sanity check */
-	if (file_size < 100*MB || file_size > 200*MB) { /* DRAM size is 256 MiB */
+	long file_size = maspro_get_filesize(ROOTFS_FILE_NUM);
+	if (file_size < 100*MB || file_size > 400*MB) { /* DRAM size is 256 MiB */
 		lcd_print("\n" PREFIX "Invalid file size of %s\n", file_name);
 		maspro_set_status(BOOT_FILE_NUM, FAILED);
 		return;
 	}
-
 	/* read file */
 	ulong size = read_file(LOAD_ADDR, file_name, 0, 0);
 
@@ -679,6 +743,36 @@ static void update_rootfs(void) {
 		maspro_set_status(ROOTFS_FILE_NUM, FAILED);
 		return;
 	}
+#else
+	// do MD5SUM verify by chunks.
+    void *buf;
+    long pos = 0;
+    unsigned long bytes = 0;
+    struct MD5Context mdContext;
+    unsigned char md5sum_code[16] = {0};
+    char md5sum_str[MD5SUM_LENGTH + 1] = {'\0'};
+
+    buf = map_sysmem(LOAD_ADDR, chunk_size);
+    MD5Init(&mdContext);
+    while((bytes = read_file(LOAD_ADDR, file_name, chunk_size, pos)) != 0) {
+    	pos += bytes;
+    	MD5Update(&mdContext, buf, bytes);
+    }
+    MD5Final(md5sum_code, &mdContext);
+    unmap_sysmem(buf);
+
+    int i = 0;
+	for (i = 0; i < 16; i++) {
+		sprintf(md5sum_str + 2*i, "%02x", md5sum_code[i]);
+	}
+
+	if(0 != strncmp(md5sum_str, md5sum, MD5SUM_LENGTH))
+	{
+		maspro_set_status(ROOTFS_FILE_NUM, FAILED);
+		lcd_print("\n" PREFIX "md5sum verify error!\n");
+		return;
+	}
+#endif
 
 	/* md5sum check */
 	if (md5sum_check_equaled(ROOTFS_FILE_NUM, md5sum)) {
@@ -702,8 +796,7 @@ static void update_rootfs(void) {
 	ulong blkcnt = 0;
 	ulong blkstart = ROOTFS_BLK_START;
 	ulong file_pos = 0;
-	ulong chunk_size = 0x4000000; /* 64M */
-
+    ulong size = 0;
 	do {
 		size = read_file(LOAD_ADDR, file_name, chunk_size, file_pos);
 		blkcnt = cal_blkcnt(size);
@@ -808,7 +901,7 @@ static int do_massproduction(cmd_tbl_t *cmdtp, int flag, int argc, char * const 
 	}
 
 	/* search upgrade files */
-	search_upgrade_files();
+	search_upgrade_files(SEARCH_FILE_PATH);
 
 	if (0 == maspro_user_mode
 			&& 0 == maspro_super_mode) {
